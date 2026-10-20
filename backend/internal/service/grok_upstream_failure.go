@@ -99,11 +99,11 @@ func classifyGrokUpstreamFailure(statusCode int, responseBody []byte, requestedM
 	// Billing / hard quota (not free-tier rolling).
 	// Cooldown stays at 30m to match the existing Grok 402/spending-limit
 	// handler (longer cools would change ops behavior without a settings knob).
-	if isGrokBillingQuotaText(low) || statusCode == http.StatusPaymentRequired {
+	// A bare 402 is not billing evidence: xAI returns an empty body for requests
+	// that a healthy paid account can still serve. Cooling on the status alone
+	// quarantines the failover chain the same way an unrecognized 403 does.
+	if isGrokBillingQuotaText(low) || (statusCode == http.StatusPaymentRequired && grokPaymentBodyIdentifiesAccount(responseBody)) {
 		reason := firstNonEmpty(text, "billing quota")
-		if statusCode == http.StatusPaymentRequired && text == "" {
-			reason = "payment required"
-		}
 		return GrokUpstreamFailureDecision{
 			Class:          GrokFailureBilling,
 			Model:          model,
@@ -129,17 +129,21 @@ func classifyGrokUpstreamFailure(statusCode int, responseBody []byte, requestedM
 		}
 	}
 
-	// A 403 whose body does not identify the account is request-scoped. xAI
-	// returns this for ordinary requests that healthy accounts can still serve;
-	// treating it as an entitlement failure cools every account on the failover
-	// chain. Return the error without rotating or quarantining the pool.
-	if isGrokUnrecognizedForbidden(statusCode, responseBody) {
+	// A 402/403 whose body does not identify the account is request-scoped. xAI
+	// returns these for ordinary requests that healthy accounts can still serve;
+	// treating them as payment or entitlement failures cools every account on
+	// the failover chain. Return the error without rotating or quarantining the pool.
+	if isGrokUnrecognizedPaymentRequired(statusCode, responseBody) || isGrokUnrecognizedForbidden(statusCode, responseBody) {
+		reason := "unrecognized grok forbidden response"
+		if statusCode == http.StatusPaymentRequired {
+			reason = "unrecognized grok payment response"
+		}
 		return GrokUpstreamFailureDecision{
 			Class:          GrokFailureCompatibility,
 			Model:          model,
 			ShouldFailover: false,
 			ShouldCooldown: false,
-			Reason:         firstNonEmpty(text, "unrecognized grok forbidden response"),
+			Reason:         firstNonEmpty(text, reason),
 		}
 	}
 
@@ -384,7 +388,8 @@ func isGrokBillingQuotaText(low string) bool {
 	if strings.Contains(low, "billing") && strings.Contains(low, "quota") {
 		return true
 	}
-	if strings.Contains(low, "payment") && (strings.Contains(low, "required") || strings.Contains(low, "fail")) {
+	if strings.Contains(low, "payment") && (strings.Contains(low, "required") || strings.Contains(low, "fail")) &&
+		!isGrokGenericPaymentStatusText(low) {
 		return true
 	}
 	if strings.Contains(low, "spending limit") || strings.Contains(low, "run out of credits") || strings.Contains(low, "out of credits") ||
@@ -446,6 +451,40 @@ func shouldMarkGrokTeamModelRateLimit(statusCode int, responseBody []byte) bool 
 		return false
 	}
 	return statusCode == http.StatusTooManyRequests || decision.Class == GrokFailureFreeUsage
+}
+
+// isGrokUnrecognizedPaymentRequired is true for a 402 that carries no
+// recognized billing signal. Empty bodies and generic payloads belong here.
+// Explicit spending-limit, credit, and subscription-required evidence stays on
+// the account cooldown path.
+func isGrokUnrecognizedPaymentRequired(statusCode int, responseBody []byte) bool {
+	if statusCode != http.StatusPaymentRequired {
+		return false
+	}
+	return !grokPaymentBodyIdentifiesAccount(responseBody)
+}
+
+func grokPaymentBodyIdentifiesAccount(responseBody []byte) bool {
+	if isGrokSpendingLimitError(responseBody) {
+		return true
+	}
+	_, _, low := grokUpstreamErrorCorpus(http.StatusPaymentRequired, responseBody)
+	if isGrokGenericPaymentStatusText(low) {
+		return false
+	}
+	return isGrokBillingQuotaText(low)
+}
+
+func isGrokGenericPaymentStatusText(low string) bool {
+	normalized := strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(low))), " ")
+	switch normalized {
+	case "", "402", "402 payment required", "payment required", "http 402", "http 402 payment required":
+		return true
+	default:
+		return strings.Contains(normalized, "<html") && strings.Contains(normalized, "payment required") &&
+			!strings.Contains(normalized, "credit") && !strings.Contains(normalized, "subscription") &&
+			!strings.Contains(normalized, "billing") && !strings.Contains(normalized, "spending")
+	}
 }
 
 // isGrokUnrecognizedForbidden is true for a 403 that carries no recognized

@@ -77,6 +77,23 @@ func TestClassifyGrokUpstreamFailure_GrokSubscriptionRequiredIsBilling(t *testin
 	require.True(t, d.ShouldCooldown)
 }
 
+func TestClassifyGrokUpstreamFailure_UnrecognizedPaymentRequiredDoesNotQuarantine(t *testing.T) {
+	bodies := [][]byte{
+		nil,
+		[]byte(""),
+		[]byte(" "),
+		[]byte("<html>402 Payment Required</html>"),
+		[]byte(`{"error":{"message":"upstream returned an unknown response"}}`),
+	}
+	for _, body := range bodies {
+		d := classifyGrokUpstreamFailure(http.StatusPaymentRequired, body, "grok-4.7")
+		require.Equal(t, GrokFailureCompatibility, d.Class, string(body))
+		require.False(t, d.ShouldFailover, string(body))
+		require.False(t, d.ShouldCooldown, string(body))
+		require.True(t, isGrokUnrecognizedPaymentRequired(http.StatusPaymentRequired, body), string(body))
+	}
+}
+
 func TestGrokRetryableOnSameAccount_CapacityAndRateLimit(t *testing.T) {
 	account := &Account{ID: 9105, Platform: PlatformGrok, Type: AccountTypeOAuth}
 	require.True(t, grokRetryableOnSameAccount(account, http.StatusTooManyRequests,

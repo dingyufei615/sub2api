@@ -334,6 +334,41 @@ func TestHandleGrokAccountUpstreamErrorUnrecognized403DoesNotCooldownOrFailover(
 	}
 }
 
+func TestHandleGrokAccountUpstreamErrorUnrecognized402DoesNotQuarantine(t *testing.T) {
+	svc := &OpenAIGatewayService{accountRepo: &grokQuotaAccountRepo{}}
+	bodies := [][]byte{
+		nil,
+		[]byte(""),
+		[]byte("<html>402 Payment Required</html>"),
+		[]byte(`{"error":{"message":"upstream returned an unknown response"}}`),
+	}
+	for i, body := range bodies {
+		repo := &grokQuotaAccountRepo{}
+		svc.accountRepo = repo
+		account := &Account{ID: int64(4900 + i), Platform: PlatformGrok, Type: AccountTypeOAuth}
+		svc.handleGrokAccountUpstreamError(context.Background(), account, http.StatusPaymentRequired, nil, body)
+		require.Zero(t, repo.tempUnschedCalls, string(body))
+		require.Zero(t, repo.rateLimitedCalls, string(body))
+		require.False(t, svc.isOpenAIAccountRuntimeBlocked(account), string(body))
+		require.False(t, svc.shouldFailoverGrokUpstreamError(http.StatusPaymentRequired, body), string(body))
+	}
+}
+
+func TestHandleGrokAccountUpstreamErrorRecognized402StillCools(t *testing.T) {
+	repo := &grokQuotaAccountRepo{}
+	svc := &OpenAIGatewayService{accountRepo: repo}
+	account := &Account{ID: 4910, Platform: PlatformGrok, Type: AccountTypeOAuth}
+	body := []byte(`{"error":{"message":"You have run out of credits or need a Grok subscription"}}`)
+	before := time.Now()
+
+	svc.handleGrokAccountUpstreamError(context.Background(), account, http.StatusPaymentRequired, nil, body)
+
+	require.Equal(t, 1, repo.rateLimitedCalls)
+	require.Zero(t, repo.tempUnschedCalls)
+	require.WithinDuration(t, before.Add(grokSpendingLimitProbeCooldown), repo.lastRateLimitResetAt, 2*time.Second)
+	require.True(t, svc.shouldFailoverGrokUpstreamError(http.StatusPaymentRequired, body))
+}
+
 func TestHandleGrokAccountUpstreamErrorEntitlement403KeepsDefaultCooldown(t *testing.T) {
 	repo := &grokQuotaAccountRepo{}
 	svc := &OpenAIGatewayService{accountRepo: repo}
@@ -370,7 +405,12 @@ func TestHandleGrokAccountUpstreamErrorDefaultCooldownsRespectPoolMode(t *testin
 				},
 			}
 			body := []byte(`{"error":{"code":"account_suspended","message":"account suspended"}}`)
-			if statusCode != http.StatusForbidden {
+			switch statusCode {
+			case http.StatusForbidden:
+				body = []byte(`{"error":{"message":"subscription required"}}`)
+			case http.StatusPaymentRequired:
+				body = []byte(`{"error":{"message":"You have run out of credits or need a Grok subscription"}}`)
+			default:
 				body = []byte(`{"error":{"message":"grok access or entitlement denied"}}`)
 			}
 
